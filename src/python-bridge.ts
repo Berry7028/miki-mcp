@@ -20,26 +20,46 @@ export interface PythonResponse {
   execution_time_ms?: number;
 }
 
+// Default timeout for Python calls in milliseconds
+const DEFAULT_TIMEOUT_MS = 30000;
+
+export interface PythonBridgeOptions {
+  pythonPath?: string;
+  executorPath?: string;
+  timeoutMs?: number;
+}
+
 export class PythonBridge {
   private pythonProcess!: ChildProcessWithoutNullStreams;
   private pythonReader!: readline.Interface;
   private pendingResolvers: Array<{
     resolve: (value: PythonResponse) => void;
     reject: (error: Error) => void;
+    timeoutId: ReturnType<typeof setTimeout>;
   }> = [];
   private isRestarting = false;
-  private initialized = false;
+  private initializationPromise: Promise<void> | null = null;
   private screenSize: { width: number; height: number } = { width: 0, height: 0 };
+  private readonly pythonPath: string;
+  private readonly executorPath: string;
+  private readonly timeoutMs: number;
 
-  constructor() {
+  constructor(options: PythonBridgeOptions = {}) {
+    // Allow configurable paths via options or environment variables
+    this.pythonPath =
+      options.pythonPath ||
+      process.env.MIKI_PYTHON_PATH ||
+      path.join(process.cwd(), "venv", "bin", "python");
+    this.executorPath =
+      options.executorPath ||
+      process.env.MIKI_EXECUTOR_PATH ||
+      path.join(process.cwd(), "src/executor/main.py");
+    this.timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
     this.startPythonProcess();
   }
 
   private startPythonProcess() {
-    const pythonPath = path.join(process.cwd(), "venv", "bin", "python");
-    const executorPath = path.join(process.cwd(), "src/executor/main.py");
-
-    this.pythonProcess = spawn(pythonPath, [executorPath]);
+    this.pythonProcess = spawn(this.pythonPath, [this.executorPath]);
 
     this.pythonReader = readline.createInterface({
       input: this.pythonProcess.stdout,
@@ -49,6 +69,8 @@ export class PythonBridge {
     this.pythonReader.on("line", (line) => {
       const pending = this.pendingResolvers.shift();
       if (pending) {
+        // Clear the timeout since we got a response
+        clearTimeout(pending.timeoutId);
         try {
           pending.resolve(JSON.parse(line));
         } catch {
@@ -58,6 +80,7 @@ export class PythonBridge {
     });
 
     this.pythonProcess.stderr.on("data", (data) => {
+      // Log stderr but don't treat it as a response
       console.error(`Python stderr: ${data}`);
     });
 
@@ -89,11 +112,15 @@ export class PythonBridge {
       // Already terminated
     }
 
-    // Reject pending requests
+    // Reject all pending requests with their timeouts cleared
     for (const pending of this.pendingResolvers) {
+      clearTimeout(pending.timeoutId);
       pending.reject(new Error("Python process crashed"));
     }
     this.pendingResolvers = [];
+
+    // Reset initialization state
+    this.initializationPromise = null;
 
     // Wait and restart
     await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -104,18 +131,51 @@ export class PythonBridge {
     await this.init();
   }
 
-  private callPython(action: string, params: Record<string, unknown> = {}): Promise<PythonResponse> {
+  private callPython(
+    action: string,
+    params: Record<string, unknown> = {},
+    timeoutMs?: number,
+  ): Promise<PythonResponse> {
+    const timeout = timeoutMs ?? this.timeoutMs;
+
     return new Promise((resolve, reject) => {
-      this.pendingResolvers.push({ resolve, reject });
-      this.pythonProcess.stdin.write(JSON.stringify({ action, params }) + "\n");
+      // Set up timeout to prevent indefinite waiting
+      const timeoutId = setTimeout(() => {
+        // Find and remove this pending request
+        const index = this.pendingResolvers.findIndex((p) => p.timeoutId === timeoutId);
+        if (index !== -1) {
+          this.pendingResolvers.splice(index, 1);
+        }
+        reject(new Error(`Python call '${action}' timed out after ${timeout}ms`));
+      }, timeout);
+
+      this.pendingResolvers.push({ resolve, reject, timeoutId });
+
+      try {
+        this.pythonProcess.stdin.write(JSON.stringify({ action, params }) + "\n");
+      } catch (error) {
+        clearTimeout(timeoutId);
+        const index = this.pendingResolvers.findIndex((p) => p.timeoutId === timeoutId);
+        if (index !== -1) {
+          this.pendingResolvers.splice(index, 1);
+        }
+        reject(new Error(`Failed to write to Python process: ${error}`));
+      }
     });
   }
 
   async init(): Promise<void> {
-    if (this.initialized) return;
-    const res = await this.callPython("size");
-    this.screenSize = { width: res.width || 0, height: res.height || 0 };
-    this.initialized = true;
+    // Use a promise to prevent race conditions during concurrent init calls
+    if (this.initializationPromise) {
+      return this.initializationPromise;
+    }
+
+    this.initializationPromise = (async () => {
+      const res = await this.callPython("size");
+      this.screenSize = { width: res.width || 0, height: res.height || 0 };
+    })();
+
+    return this.initializationPromise;
   }
 
   getScreenSize(): { width: number; height: number } {
@@ -337,13 +397,35 @@ export class PythonBridge {
   }
 
   /**
-   * Close the Python bridge
+   * Close the Python bridge with timeout
    */
   destroy(): void {
+    // Clear all pending requests
+    for (const pending of this.pendingResolvers) {
+      clearTimeout(pending.timeoutId);
+      pending.reject(new Error("Python bridge destroyed"));
+    }
+    this.pendingResolvers = [];
+
     try {
+      // Try to send exit command first
       this.pythonProcess.stdin.write(JSON.stringify({ action: "exit" }) + "\n");
+
+      // Give the process a short time to exit gracefully
+      const killTimeout = setTimeout(() => {
+        try {
+          this.pythonProcess.kill("SIGKILL");
+        } catch {
+          // Already terminated
+        }
+      }, 1000);
+
+      this.pythonProcess.once("exit", () => {
+        clearTimeout(killTimeout);
+      });
+
       this.pythonReader.close();
-      this.pythonProcess.kill();
+      this.pythonProcess.kill("SIGTERM");
     } catch {
       // Already terminated
     }
